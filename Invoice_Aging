@@ -1,0 +1,62 @@
+-- =============================================================================
+-- File        : queries/ap/invoice_aging.sql
+-- Description : Accounts Payable invoice aging by vendor. Buckets open invoices
+--               into standard aging bands to support cash-flow planning and
+--               vendor payment prioritization.
+-- Updated     : 2026-09
+-- Parameters  : @AsOfDate  DATE — aging cutoff date (default: today)
+-- =============================================================================
+
+DECLARE @AsOfDate DATE = ISNULL(@AsOfDate, CAST(GETDATE() AS DATE));
+
+WITH invoice_balance AS (
+    SELECT
+        i.invoice_id,
+        i.vendor_id,
+        i.property_id,
+        i.invoice_number,
+        i.invoice_date,
+        i.due_date,
+        i.invoice_amount,
+        ISNULL(SUM(ap.amount_paid), 0)                         AS total_paid,
+        i.invoice_amount - ISNULL(SUM(ap.amount_paid), 0)     AS balance_due,
+        DATEDIFF(DAY, i.due_date, @AsOfDate)                   AS days_past_due
+    FROM ap_invoice  i
+    LEFT JOIN ap_payment ap ON ap.invoice_id = i.invoice_id
+    WHERE i.invoice_status <> 'Voided'
+      AND i.invoice_date   <= @AsOfDate
+    GROUP BY
+        i.invoice_id, i.vendor_id, i.property_id,
+        i.invoice_number, i.invoice_date, i.due_date, i.invoice_amount
+    HAVING
+        i.invoice_amount - ISNULL(SUM(ap.amount_paid), 0) > 0
+)
+SELECT
+    v.vendor_code,
+    v.vendor_name,
+    v.vendor_category,
+    v.payment_terms,
+    p.property_code,
+    ib.invoice_number,
+    ib.invoice_date,
+    ib.due_date,
+    ib.invoice_amount,
+    ib.total_paid,
+    ib.balance_due,
+    ib.days_past_due,
+    -- Aging bucket
+    CASE
+        WHEN ib.days_past_due <= 0              THEN 'Current'
+        WHEN ib.days_past_due BETWEEN 1  AND 30 THEN '1-30 Days'
+        WHEN ib.days_past_due BETWEEN 31 AND 60 THEN '31-60 Days'
+        WHEN ib.days_past_due BETWEEN 61 AND 90 THEN '61-90 Days'
+        ELSE                                         '90+ Days'
+    END AS aging_bucket,
+    -- Vendor-level totals for grouping in reports
+    SUM(ib.balance_due) OVER (PARTITION BY ib.vendor_id) AS vendor_total_exposure
+FROM invoice_balance ib
+JOIN vendor          v ON v.vendor_id    = ib.vendor_id
+JOIN property        p ON p.property_id  = ib.property_id
+ORDER BY
+    vendor_total_exposure DESC,
+    ib.days_past_due       DESC;
