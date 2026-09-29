@@ -1,0 +1,70 @@
+-- =============================================================================
+-- File        : queries/receivables/delinquency_report.sql
+-- Description : Identifies tenants with outstanding balances past due beyond a
+--               configurable threshold. Supports collections workflow and
+--               property manager dashboards. Ranks delinquencies by exposure.
+-- Updated     : 2026-09
+-- Parameters  : @AsOfDate         DATE — reporting date
+--               @MinDaysPastDue   INT  — minimum days past due to include (default 1)
+-- =============================================================================
+
+DECLARE @AsOfDate       DATE = ISNULL(@AsOfDate, CAST(GETDATE() AS DATE));
+DECLARE @MinDaysPastDue INT  = ISNULL(@MinDaysPastDue, 1);
+
+WITH net_charge AS (
+    SELECT
+        c.charge_id,
+        c.lease_id,
+        c.due_date,
+        c.charge_type,
+        c.charge_amount
+            - ISNULL((
+                SELECT SUM(pa2.allocated_amount)
+                FROM   payment_allocation pa2
+                JOIN   payment p2 ON p2.payment_id = pa2.payment_id AND p2.is_voided = 0
+                WHERE  pa2.charge_id = c.charge_id
+              ), 0)                              AS balance_due
+    FROM charge c
+    WHERE c.is_voided = 0
+      AND c.due_date  < @AsOfDate
+),
+delinquent AS (
+    SELECT
+        nc.lease_id,
+        SUM(nc.balance_due)                      AS total_balance,
+        MAX(DATEDIFF(DAY, nc.due_date, @AsOfDate)) AS max_days_past_due,
+        COUNT(nc.charge_id)                      AS open_charge_count
+    FROM net_charge nc
+    WHERE nc.balance_due > 0
+    GROUP BY nc.lease_id
+    HAVING MAX(DATEDIFF(DAY, nc.due_date, @AsOfDate)) >= @MinDaysPastDue
+)
+SELECT
+    p.property_code,
+    p.property_name,
+    u.unit_number,
+    t.tenant_code,
+    t.tenant_name,
+    t.email,
+    t.phone,
+    l.lease_start,
+    l.lease_end,
+    d.open_charge_count,
+    d.max_days_past_due,
+    d.total_balance,
+    -- Severity tier for prioritization
+    CASE
+        WHEN d.max_days_past_due > 90 THEN 'Critical'
+        WHEN d.max_days_past_due > 60 THEN 'High'
+        WHEN d.max_days_past_due > 30 THEN 'Medium'
+        ELSE                               'Low'
+    END                                          AS severity_tier,
+    -- Portfolio rank by exposure
+    RANK() OVER (ORDER BY d.total_balance DESC)  AS exposure_rank
+FROM delinquent d
+JOIN lease      l ON l.lease_id    = d.lease_id
+JOIN unit       u ON u.unit_id     = l.unit_id
+JOIN property   p ON p.property_id = u.property_id
+JOIN tenant     t ON t.tenant_id   = l.tenant_id
+ORDER BY
+    d.total_balance DESC;
