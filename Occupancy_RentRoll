@@ -1,0 +1,80 @@
+-- =============================================================================
+-- File        : queries/revenue/occupancy_and_rent_roll.sql
+-- Description : Rent roll and occupancy snapshot as of a given date. Lists all
+--               units with current lease status, contracted rent, and vacancy
+--               flags. Supports investor reporting and NOI analysis.
+-- Updated     : 2026-09
+-- Parameters  : @AsOfDate  DATE — snapshot date (default: today)
+-- =============================================================================
+
+DECLARE @AsOfDate DATE = ISNULL(@AsOfDate, CAST(GETDATE() AS DATE));
+
+WITH active_lease AS (
+    -- One active lease per unit as of the snapshot date
+    SELECT
+        l.unit_id,
+        l.lease_id,
+        l.tenant_id,
+        l.lease_start,
+        l.lease_end,
+        l.monthly_rent,
+        l.security_deposit,
+        l.lease_status,
+        ROW_NUMBER() OVER (
+            PARTITION BY l.unit_id
+            ORDER BY l.lease_start DESC
+        ) AS rn
+    FROM lease l
+    WHERE l.lease_start <= @AsOfDate
+      AND (l.lease_end IS NULL OR l.lease_end >= @AsOfDate)
+      AND l.lease_status = 'Active'
+)
+SELECT
+    p.property_code,
+    p.property_name,
+    p.region_code,
+    p.market_code,
+    u.unit_number,
+    u.unit_type,
+    u.square_feet,
+    u.floor_number,
+    -- Occupancy status
+    CASE WHEN al.lease_id IS NOT NULL THEN 'Occupied' ELSE 'Vacant' END AS occupancy_status,
+    t.tenant_code,
+    t.tenant_name,
+    al.lease_start,
+    al.lease_end,
+    -- Days remaining on lease
+    CASE
+        WHEN al.lease_end IS NOT NULL
+        THEN DATEDIFF(DAY, @AsOfDate, al.lease_end)
+        ELSE NULL
+    END AS days_remaining,
+    al.monthly_rent,
+    al.security_deposit,
+    -- Annualized contracted rent
+    ISNULL(al.monthly_rent, 0) * 12                        AS annualized_rent,
+    -- Rent per square foot (monthly)
+    CASE
+        WHEN u.square_feet > 0
+        THEN ROUND(ISNULL(al.monthly_rent, 0) / u.square_feet, 4)
+        ELSE NULL
+    END AS rent_per_sqft,
+    -- Portfolio-level rollups via window functions
+    COUNT(u.unit_id) OVER (PARTITION BY p.property_id)     AS total_units,
+    SUM(CASE WHEN al.lease_id IS NOT NULL THEN 1 ELSE 0 END)
+        OVER (PARTITION BY p.property_id)                  AS occupied_units,
+    ROUND(
+        100.0 * SUM(CASE WHEN al.lease_id IS NOT NULL THEN 1 ELSE 0 END)
+                    OVER (PARTITION BY p.property_id)
+              / NULLIF(COUNT(u.unit_id) OVER (PARTITION BY p.property_id), 0),
+    2)                                                      AS property_occupancy_pct
+FROM unit         u
+JOIN property     p  ON p.property_id = u.property_id
+LEFT JOIN active_lease al ON al.unit_id = u.unit_id AND al.rn = 1
+LEFT JOIN tenant   t  ON t.tenant_id  = al.tenant_id
+WHERE u.is_active  = 1
+  AND p.is_active  = 1
+ORDER BY
+    p.property_code,
+    u.unit_number;
