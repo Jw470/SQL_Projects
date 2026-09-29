@@ -1,0 +1,60 @@
+-- =============================================================================
+-- File        : queries/ap/vendor_spend_analysis.sql
+-- Description : Vendor spend analysis summarizing AP invoice activity by
+--               vendor and expense category for a given fiscal period range.
+--               Supports budget-to-actual review and vendor consolidation work.
+-- Updated     : 2026-09
+-- Parameters  : @PeriodStart  CHAR(7)  — e.g. '2026-01'
+--               @PeriodEnd    CHAR(7)  — e.g. '2026-09'
+-- =============================================================================
+
+DECLARE @PeriodStart CHAR(7) = @PeriodStart;
+DECLARE @PeriodEnd   CHAR(7) = @PeriodEnd;
+
+WITH spend AS (
+    SELECT
+        i.vendor_id,
+        i.property_id,
+        i.account_id,
+        i.posted_period,
+        SUM(i.invoice_amount)  AS invoiced_amount,
+        SUM(ap.amount_paid)    AS paid_amount,
+        COUNT(i.invoice_id)    AS invoice_count
+    FROM ap_invoice  i
+    LEFT JOIN ap_payment ap ON ap.invoice_id = i.invoice_id
+    WHERE i.invoice_status <> 'Voided'
+      AND i.posted_period BETWEEN @PeriodStart AND @PeriodEnd
+    GROUP BY
+        i.vendor_id, i.property_id, i.account_id, i.posted_period
+)
+SELECT
+    v.vendor_category,
+    v.vendor_code,
+    v.vendor_name,
+    p.property_code,
+    p.property_name,
+    a.account_code,
+    a.account_name,
+    s.posted_period,
+    s.invoice_count,
+    s.invoiced_amount,
+    ISNULL(s.paid_amount, 0)                                AS paid_amount,
+    s.invoiced_amount - ISNULL(s.paid_amount, 0)           AS remaining_balance,
+    -- Vendor share of total spend in period
+    ROUND(
+        100.0 * SUM(s.invoiced_amount) OVER (PARTITION BY s.vendor_id)
+              / NULLIF(SUM(s.invoiced_amount) OVER (), 0),
+    2)                                                      AS vendor_pct_of_total,
+    -- Category share of total spend
+    ROUND(
+        100.0 * SUM(s.invoiced_amount) OVER (PARTITION BY v.vendor_category)
+              / NULLIF(SUM(s.invoiced_amount) OVER (), 0),
+    2)                                                      AS category_pct_of_total
+FROM spend       s
+JOIN vendor      v ON v.vendor_id    = s.vendor_id
+JOIN property    p ON p.property_id  = s.property_id
+JOIN gl_account  a ON a.account_id   = s.account_id
+ORDER BY
+    v.vendor_category,
+    SUM(s.invoiced_amount) OVER (PARTITION BY s.vendor_id) DESC,
+    s.posted_period;
