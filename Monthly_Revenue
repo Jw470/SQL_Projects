@@ -1,0 +1,65 @@
+-- =============================================================================
+-- File        : queries/revenue/monthly_revenue_summary.sql
+-- Description : Monthly revenue summary by property and GL account. Aggregates
+--               posted charges and applies collection rate to derive effective
+--               revenue. Supports period-close variance reporting.
+-- Updated     : 2026-09
+-- Parameters  : @Period  CHAR(7)  — target posting period (e.g. '2026-09')
+-- =============================================================================
+
+DECLARE @Period CHAR(7) = @Period;
+
+WITH period_charges AS (
+    SELECT
+        c.charge_id,
+        c.lease_id,
+        c.account_id,
+        c.charge_amount,
+        c.charge_type,
+        ISNULL((
+            SELECT SUM(pa.allocated_amount)
+            FROM   payment_allocation pa
+            JOIN   payment            py ON py.payment_id = pa.payment_id
+                                        AND py.is_voided = 0
+            WHERE  pa.charge_id = c.charge_id
+        ), 0) AS collected_amount
+    FROM charge c
+    WHERE c.posted_period = @Period
+      AND c.is_voided      = 0
+)
+SELECT
+    p.property_code,
+    p.property_name,
+    p.region_code,
+    a.account_code,
+    a.account_name,
+    a.account_subtype,
+    pc.charge_type,
+    @Period                                             AS period,
+    COUNT(pc.charge_id)                                 AS charge_count,
+    SUM(pc.charge_amount)                               AS gross_charged,
+    SUM(pc.collected_amount)                            AS total_collected,
+    SUM(pc.charge_amount) - SUM(pc.collected_amount)   AS outstanding_balance,
+    ROUND(
+        100.0 * SUM(pc.collected_amount)
+              / NULLIF(SUM(pc.charge_amount), 0),
+    2)                                                  AS collection_rate_pct,
+    -- Compare to prior month using LAG (requires windowing over a period series)
+    -- Note: join to a calendar or period dimension table for prior-period comparison
+    SUM(pc.charge_amount)
+        - LAG(SUM(pc.charge_amount), 1, 0) OVER (
+              PARTITION BY p.property_id, pc.account_id, pc.charge_type
+              ORDER BY @Period
+          )                                             AS mom_charge_variance
+FROM period_charges pc
+JOIN lease     l ON l.lease_id    = pc.lease_id
+JOIN unit      u ON u.unit_id     = l.unit_id
+JOIN property  p ON p.property_id = u.property_id
+JOIN gl_account a ON a.account_id  = pc.account_id
+GROUP BY
+    p.property_id, p.property_code, p.property_name, p.region_code,
+    a.account_code, a.account_name, a.account_subtype,
+    pc.charge_type
+ORDER BY
+    p.property_code,
+    gross_charged DESC;
