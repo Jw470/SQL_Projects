@@ -1,0 +1,65 @@
+-- =============================================================================
+-- File        : queries/receivables/ar_aging_summary.sql
+-- Description : Accounts Receivable aging summary grouped by property.
+--               Buckets outstanding balances into 0-30, 31-60, 61-90, and
+--               90+ day bands relative to a given as-of date.
+--               Supports period-end close and collections prioritization.
+-- =============================================================================
+
+DECLARE @AsOfDate DATE = ISNULL(@AsOfDate, CAST(GETDATE() AS DATE));
+
+WITH charge_balance AS (
+    -- Net balance per charge after applying all non-voided allocations
+    SELECT
+        c.charge_id,
+        c.lease_id,
+        c.charge_date,
+        c.due_date,
+        c.charge_type,
+        c.charge_amount,
+        ISNULL(SUM(pa.allocated_amount), 0)          AS total_applied,
+        c.charge_amount - ISNULL(SUM(pa.allocated_amount), 0) AS balance_due
+    FROM charge c
+    LEFT JOIN payment_allocation pa ON pa.charge_id = c.charge_id
+    LEFT JOIN payment            p  ON p.payment_id = pa.payment_id
+                                   AND p.is_voided = 0
+    WHERE c.is_voided = 0
+      AND c.charge_date <= @AsOfDate
+    GROUP BY
+        c.charge_id, c.lease_id, c.charge_date,
+        c.due_date, c.charge_type, c.charge_amount
+    HAVING
+        c.charge_amount - ISNULL(SUM(pa.allocated_amount), 0) > 0
+),
+aged AS (
+    SELECT
+        cb.charge_id,
+        cb.lease_id,
+        cb.balance_due,
+        DATEDIFF(DAY, cb.due_date, @AsOfDate) AS days_past_due
+    FROM charge_balance cb
+)
+SELECT
+    p.property_code,
+    p.property_name,
+    -- Current (not yet past due)
+    SUM(CASE WHEN a.days_past_due <= 0                        THEN a.balance_due ELSE 0 END) AS current_balance,
+    -- 1–30 days past due
+    SUM(CASE WHEN a.days_past_due BETWEEN 1  AND 30           THEN a.balance_due ELSE 0 END) AS bucket_1_30,
+    -- 31–60 days past due
+    SUM(CASE WHEN a.days_past_due BETWEEN 31 AND 60           THEN a.balance_due ELSE 0 END) AS bucket_31_60,
+    -- 61–90 days past due
+    SUM(CASE WHEN a.days_past_due BETWEEN 61 AND 90           THEN a.balance_due ELSE 0 END) AS bucket_61_90,
+    -- Over 90 days past due
+    SUM(CASE WHEN a.days_past_due > 90                        THEN a.balance_due ELSE 0 END) AS bucket_over_90,
+    -- Grand total AR balance
+    SUM(a.balance_due)                                                                        AS total_ar_balance
+FROM aged       a
+JOIN lease      l ON l.lease_id    = a.lease_id
+JOIN unit       u ON u.unit_id     = l.unit_id
+JOIN property   p ON p.property_id = u.property_id
+GROUP BY
+    p.property_code,
+    p.property_name
+ORDER BY
+    total_ar_balance DESC;
