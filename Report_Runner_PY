@@ -1,0 +1,250 @@
+# =============================================================================
+# File        : report_runner.py
+# Description : Connects to SQL Server, runs all enabled SQL reports, and
+#               writes results to a dated Excel workbook — one sheet per report.
+#               Schedule monthly via Windows Task Scheduler.
+# Updated     : 2026-09
+# Usage
+# -----
+#   python report_runner.py                              # run all reports
+#   python report_runner.py --report "AR Aging Summary"  # run one report
+#   python report_runner.py --list                       # list reports
+#
+# Dependencies
+#   pip install pyodbc pandas openpyxl
+# =============================================================================
+
+import os
+import re
+import logging
+import argparse
+import pyodbc
+import pandas as pd
+from datetime import date
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+from config import DB_CONFIG, OUTPUT_DIR, REPORTS, CURRENT_PERIOD
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(
+            os.path.join(LOG_DIR, f"report_runner_{date.today().strftime('%Y%m')}.log")
+        ),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+def get_connection():
+    if DB_CONFIG.get("trusted_connection"):
+        conn_str = (
+            f"DRIVER={{{DB_CONFIG['driver']}}};"
+            f"SERVER={DB_CONFIG['server']};"
+            f"DATABASE={DB_CONFIG['database']};"
+            f"Trusted_Connection=yes;"
+        )
+    else:
+        conn_str = (
+            f"DRIVER={{{DB_CONFIG['driver']}}};"
+            f"SERVER={DB_CONFIG['server']};"
+            f"DATABASE={DB_CONFIG['database']};"
+            f"UID={DB_CONFIG['username']};"
+            f"PWD={DB_CONFIG['password']};"
+        )
+    return pyodbc.connect(conn_str, timeout=30)
+
+
+# ---------------------------------------------------------------------------
+# SQL Loading & Parameter Injection
+# ---------------------------------------------------------------------------
+def load_sql(filepath: str, params: dict) -> str:
+    base_dir  = os.path.dirname(os.path.abspath(__file__))
+    full_path = os.path.normpath(os.path.join(base_dir, "..", filepath))
+
+    if not os.path.exists(full_path):
+        raise FileNotFoundError(f"SQL file not found: {full_path}")
+
+    with open(full_path, "r", encoding="utf-8") as f:
+        sql = f.read()
+
+    for param_name, value in params.items():
+        if isinstance(value, str):
+            literal = f"'{value}'"
+        elif isinstance(value, bool):
+            literal = "1" if value else "0"
+        else:
+            literal = str(value)
+
+        pattern     = rf"(DECLARE\s+@{re.escape(param_name)}\s+\S+\s*=\s*)[^;\n]+"
+        replacement = rf"\g<1>{literal}"
+        sql         = re.sub(pattern, replacement, sql, flags=re.IGNORECASE)
+
+    return sql
+
+
+# ---------------------------------------------------------------------------
+# Query Execution
+# ---------------------------------------------------------------------------
+def run_query(conn, sql: str, report_name: str) -> pd.DataFrame:
+    log.info(f"  Running: {report_name}")
+    try:
+        df = pd.read_sql(sql, conn)
+        log.info(f"  ✓ {len(df):,} rows returned")
+        return df
+    except Exception as e:
+        log.error(f"  ✗ Query failed — {e}")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Excel Formatting
+# ---------------------------------------------------------------------------
+HEADER_FILL = PatternFill("solid", fgColor="1F3864")
+HEADER_FONT = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
+DATA_FONT   = Font(name="Calibri", size=10)
+ALT_FILL    = PatternFill("solid", fgColor="EEF2F7")
+BORDER_SIDE = Side(style="thin", color="D0D7E3")
+CELL_BORDER = Border(
+    left=BORDER_SIDE, right=BORDER_SIDE,
+    top=BORDER_SIDE,  bottom=BORDER_SIDE,
+)
+
+CURRENCY_COLS = {"amount", "balance", "charged", "collected", "paid",
+                 "revenue", "rent", "deposit", "spend", "invoiced",
+                 "exposure", "noi", "variance", "delta"}
+PCT_COLS      = {"pct", "rate", "percent"}
+
+
+def _is_currency_col(col):
+    return any(k in col.lower() for k in CURRENCY_COLS)
+
+def _is_pct_col(col):
+    return any(k in col.lower() for k in PCT_COLS)
+
+
+def format_sheet(ws, df: pd.DataFrame):
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        cell           = ws.cell(row=1, column=col_idx)
+        cell.value     = col_name.replace("_", " ").title()
+        cell.font      = HEADER_FONT
+        cell.fill      = HEADER_FILL
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border    = CELL_BORDER
+    ws.row_dimensions[1].height = 30
+
+    for row_idx, row in enumerate(df.itertuples(index=False), start=2):
+        fill = ALT_FILL if row_idx % 2 == 0 else PatternFill()
+        for col_idx, (col_name, value) in enumerate(zip(df.columns, row), start=1):
+            cell              = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.font         = DATA_FONT
+            cell.fill         = fill
+            cell.border       = CELL_BORDER
+            if _is_currency_col(col_name) and isinstance(value, (int, float)):
+                cell.number_format = '#,##0.00'
+            elif _is_pct_col(col_name) and isinstance(value, (int, float)):
+                cell.number_format = '0.00"%"'
+
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        max_len = max(
+            len(str(col_name)),
+            df[col_name].astype(str).str.len().max() if len(df) > 0 else 0,
+        )
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 40)
+
+    ws.freeze_panes = "A2"
+
+
+# ---------------------------------------------------------------------------
+# Excel Writer
+# ---------------------------------------------------------------------------
+def write_excel(results: list, output_path: str):
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        for sheet_name, df in results:
+            if df is None or df.empty:
+                log.warning(f"  Skipping empty sheet: {sheet_name}")
+                continue
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+            format_sheet(writer.sheets[sheet_name], df)
+    log.info(f"\n  Workbook saved → {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main(target_report=None):
+    log.info("=" * 65)
+    log.info(f"  SQL Report Runner — Period: {CURRENT_PERIOD}")
+    log.info("=" * 65)
+
+    period_dir = os.path.join(OUTPUT_DIR, CURRENT_PERIOD)
+    os.makedirs(period_dir, exist_ok=True)
+
+    output_path = os.path.join(period_dir, f"Monthly_Reports_{CURRENT_PERIOD}.xlsx")
+
+    reports_to_run = [
+        r for r in REPORTS
+        if r["enabled"]
+        and (target_report is None or r["name"].lower() == target_report.lower())
+    ]
+
+    if not reports_to_run:
+        log.warning("No matching reports found. Use --list to see available reports.")
+        return
+
+    log.info("\nConnecting to database...")
+    try:
+        conn = get_connection()
+        log.info("  ✓ Connected\n")
+    except Exception as e:
+        log.error(f"  ✗ Connection failed — {e}")
+        return
+
+    results = []
+    for report in reports_to_run:
+        log.info("─" * 50)
+        try:
+            sql = load_sql(report["file"], report["params"])
+            df  = run_query(conn, sql, report["name"])
+            results.append((report["sheet"], df))
+        except Exception as e:
+            log.error(f"  Skipping {report['name']} — {e}")
+            results.append((report["sheet"], None))
+
+    conn.close()
+
+    log.info("\n" + "─" * 50)
+    log.info("Writing Excel workbook...")
+    write_excel(results, output_path)
+    log.info("\n✓ All done.")
+    log.info("=" * 65)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Monthly SQL Report Runner")
+    parser.add_argument("--report", type=str, help="Run a single report by name")
+    parser.add_argument("--list",   action="store_true", help="List all reports")
+    args = parser.parse_args()
+
+    if args.list:
+        print("\nAvailable reports:")
+        for r in REPORTS:
+            print(f"  {'✓' if r['enabled'] else '✗'}  {r['name']}")
+    else:
+        main(target_report=args.report)
