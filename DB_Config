@@ -1,0 +1,102 @@
+# =============================================================================
+# File        : config.py
+# Description : Database connection settings and report configuration.
+#               Update DB_CONFIG with your actual server/database details.
+# Updated     : 2026-09
+# =============================================================================
+
+import os
+from datetime import date
+
+# --- Database Connection ---------------------------------------------------
+DB_CONFIG = {
+    "driver":            "ODBC Driver 17 for SQL Server",  # or "SQL Server"
+    "server":            "YOUR_SERVER_NAME",               # e.g. DESKTOP-ABC\SQLEXPRESS
+    "database":          "YOUR_DATABASE_NAME",
+    "username":          "YOUR_USERNAME",                  # blank if Windows auth
+    "password":          "YOUR_PASSWORD",                  # blank if Windows auth
+    "trusted_connection": False,                           # True = Windows auth
+}
+
+# --- Output Directory -------------------------------------------------------
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
+
+# --- Reporting Period -------------------------------------------------------
+_today = date.today()
+_first = _today.replace(day=1)
+
+CURRENT_PERIOD = _today.strftime("%Y-%m")
+PRIOR_PERIOD   = (_first.replace(month=_first.month - 1) if _first.month > 1
+                  else _first.replace(year=_first.year - 1, month=12)).strftime("%Y-%m")
+AS_OF_DATE     = _today.isoformat()
+
+# --- Reports to Run --------------------------------------------------------
+REPORTS = [
+    {
+        "name":    "AR Aging Summary",
+        "file":    "queries/receivables/ar_aging_summary.sql",
+        "sheet":   "AR Aging",
+        "enabled": True,
+        "params":  {"AsOfDate": AS_OF_DATE},
+    },
+    {
+        "name":    "Delinquency Report",
+        "file":    "queries/receivables/delinquency_report.sql",
+        "sheet":   "Delinquency",
+        "enabled": True,
+        "params":  {"AsOfDate": AS_OF_DATE, "MinDaysPastDue": 1},
+    },
+    {
+        "name":    "AP Invoice Aging",
+        "file":    "queries/ap/invoice_aging.sql",
+        "sheet":   "AP Aging",
+        "enabled": True,
+        "params":  {"AsOfDate": AS_OF_DATE},
+    },
+    {
+        "name":    "Vendor Spend Analysis",
+        "file":    "queries/ap/vendor_spend_analysis.sql",
+        "sheet":   "Vendor Spend",
+        "enabled": True,
+        "params":  {"PeriodStart": PRIOR_PERIOD, "PeriodEnd": CURRENT_PERIOD},
+    },
+    {
+        "name":    "Monthly Revenue Summary",
+        "file":    "queries/revenue/monthly_revenue_summary.sql",
+        "sheet":   "Revenue",
+        "enabled": True,
+        "params":  {"Period": CURRENT_PERIOD},
+    },
+    {
+        "name":    "Occupancy & Rent Roll",
+        "file":    "queries/revenue/occupancy_and_rent_roll.sql",
+        "sheet":   "Rent Roll",
+        "enabled": True,
+        "params":  {"AsOfDate": AS_OF_DATE},
+    },
+    {
+        "name":    "Lease Expiration Pipeline",
+        "file":    "queries/ops/lease_expiration_pipeline.sql",
+        "sheet":   "Lease Pipeline",
+        "enabled": True,
+        "params":  {"AsOfDate": AS_OF_DATE, "LookAheadDays": 90},
+    },
+    {
+        "name":    "Property Performance Scorecard",
+        "file":    "queries/ops/property_performance_scorecard.sql",
+        "sheet":   "Scorecard",
+        "enabled": True,
+        "params":  {
+            "CurrentPeriod": CURRENT_PERIOD,
+            "PriorPeriod":   PRIOR_PERIOD,
+            "AsOfDate":      AS_OF_DATE,
+        },
+    },
+    {
+        "name":    "GL Trial Balance",
+        "file":    "queries/ops/gl_trial_balance.sql",
+        "sheet":   "Trial Balance",
+        "enabled": True,
+        "params":  {"Period": CURRENT_PERIOD},
+    },
+]
